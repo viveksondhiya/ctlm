@@ -1,0 +1,98 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ctlm-config
+  namespace: ctlm
+data:
+  MYSQL_HOST: "mysql"
+  MYSQL_PORT: "3306"
+  MYSQL_DB: "ctlmdb"
+  MYSQL_USER: "root"
+  MYSQL_PASSWORD: "root"
+  NEO4J_HOST: "neo4j"
+  NEO4J_PORT: "7687"
+  NEO4J_PASSWORD: ""
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ctlm-app
+  namespace: ctlm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ctlm-app
+  template:
+    metadata:
+      labels:
+        app: ctlm-app
+    spec:
+      initContainers:
+        - name: wait-for-mysql
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z mysql 3306; do
+                echo "Waiting for MySQL..."; sleep 5;
+              done
+        - name: wait-for-kafka
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z kafka 9092; do
+                echo "Waiting for Kafka..."; sleep 5;
+              done
+        - name: wait-for-neo4j
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z neo4j 7687; do
+                echo "Waiting for Neo4j..."; sleep 5;
+              done
+      containers:
+        - name: ctlm-app
+          image: ctlm-app:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: ctlm-config
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ctlm-app
+  namespace: ctlm
+spec:
+  type: NodePort
+  selector:
+    app: ctlm-app
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
