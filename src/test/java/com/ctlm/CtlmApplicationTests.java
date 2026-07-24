@@ -20,7 +20,7 @@ class CtlmApplicationTests {
     void stateMachineAppliesValidTransition() {
         LcmStateMachineService service = new LcmStateMachineService();
         LcmState result = service.applyEvent("cnf-test", LcmEvent.INSTANTIATE);
-        assertEquals(LcmState.INSTANTIATING, result);
+        assertEquals(LcmState.INSTANTIATION_IN_PROGRESS, result);
     }
 
     @Test

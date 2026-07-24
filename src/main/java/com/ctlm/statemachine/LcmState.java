@@ -2,10 +2,10 @@ package com.ctlm.statemachine;
 
 public enum LcmState {
     UNINSTANTIATED,
-    INSTANTIATING,
-    RUNNING,
+    INSTANTIATION_IN_PROGRESS,
+    INSTANTIATED,
     SCALING,
     TERMINATING,
     TERMINATED,
-    FAILED
+    INSTANTIATION_FAILED
 }

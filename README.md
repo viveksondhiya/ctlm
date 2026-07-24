@@ -1,366 +1,244 @@
 # CTLM — CNF Topology Lifecycle Manager
 
-A production-style Spring Boot microservice that manages the full lifecycle of **Cloud-Native Network Functions (CNFs)** using an **event-driven state machine** backed by Kafka, Neo4j, and MySQL.
-
-Built as a portfolio project to demonstrate backend engineering patterns: async command processing, finite state machines, graph-based dependency modeling, audit logging, and containerized deployment.
+A production-style Spring Boot microservice that manages the full lifecycle of **Cloud-Native Network Functions (CNFs)** in a 5G RAN topology. Implements an **event-driven architecture** with Kafka, Neo4j (topology graph), and MySQL (audit trail).
 
 ---
 
-## Why This Project Exists
+## What It Does
 
-Modern infrastructure management systems need to track **what state a resource is in** and **how it got there**. A simple boolean `isRunning` flag doesn't cut it — you need:
+When **Site Management** (IPTX / ZTP) creates a Network Slice (NS), CTLM:
 
-- A **state machine** to enforce valid lifecycle transitions (can't scale something that isn't running)
-- **Async processing** so API callers aren't blocked waiting for long operations
-- A **graph DB** to model dependencies (if CNF-A depends on CNF-B, only terminate B after A is gone)
-- An **audit trail** to answer "who changed what, when, and why"
+1. Receives the NS create trigger via REST → publishes to Kafka
+2. Creates the NS and all child CNFs in Neo4j (`INSTANTIATION_IN_PROGRESS`) with characteristics and relationships
+3. Automatically fires `INSTANTIATE` + `INSTANTIATION_COMPLETE` for each CNF via Kafka (same key → ordered)
+4. Tracks state of every CNF: `INSTANTIATION_IN_PROGRESS → INSTANTIATED` or `INSTANTIATION_FAILED`
+5. When all CNFs are `INSTANTIATED` → sends a callback to Site Manager via Kafka
 
-CTLM solves all of these in a single, containerized service.
+---
+
+## NS / CNF Hierarchy
+
+```
+── GnodeB Sub6 (MACRO_SUB6) ──────────────────────────────────────
+NS  (NetworkService — super parent)
+├── CUCP  [NS_CONTAINS] → subType: MACRO_SUB6_CU_CP, neType: CU-CP
+│     ├── CUUP  [PARENT_OF] → subType: MACRO_SUB6_CU_UP, neType: CU-UP
+│     └── DU    [PARENT_OF] → subType: MACRO_SUB6_DU,    neType: DU
+├── CUUP  [NS_CONTAINS]
+└── DU    [NS_CONTAINS]
+
+── GnodeB NGDU_Sub6 (NGDU_SUB6) — same structure, different prefix ─
+NS  (NetworkService — super parent)
+├── CUCP  [NS_CONTAINS] → subType: NGDU_SUB6_CU_CP, neType: CU-CP
+│     ├── CUUP  [PARENT_OF] → subType: NGDU_SUB6_CU_UP, neType: CU-UP
+│     └── DU    [PARENT_OF] → subType: NGDU_SUB6_DU,    neType: DU
+├── CUUP  [NS_CONTAINS]
+└── DU    [NS_CONTAINS]
+```
+
+**NS type → Auto-created CNFs:**
+
+Both solutions follow the **same 3-CNF hierarchy**. The only difference is the `subType` prefix.
+
+| nsType | CNFs created | subType prefix |
+|---|---|---|
+| `GnodeB Sub6` | CUCP (parent) + CUUP + DU | `MACRO_SUB6_*` |
+| `GnodeB NGDU_Sub6` | CUCP (parent) + CUUP + DU | `NGDU_SUB6_*` |
+
+**connect.CNF.out** — returns the parent of a node:
+- CUUP / DU → CUCP
+- CUCP → NS
+
+**connect.CNF.in** — returns the children of a node:
+- NS → [CUCP, CUUP, DU]
+- CUCP → [CUUP, DU]
+- CUUP / DU → []
+
+---
+
+## Full Event-Driven Flow
+
+```
+Site Management (IPTX / ZTP)
+        │
+        │  POST /api/lcm/ns/trigger
+        │  { nsId, name, nsType, characteristics }
+        ▼
+  LcmController
+        │  202 Accepted (returns immediately)
+        │  publishes to Kafka ──────────────────────────────────────────────────┐
+        ▼                                                                        │
+Kafka: "lcm-ns-create-trigger"  ◄───────────────────────────────────────────────┘
+        │
+        ▼
+  NsCreateConsumer.consume()
+        │
+        ├─ TopologyService.triggerNsCreate()
+        │       Neo4j creates:
+        │         NS   (entityType=NetworkService, subType=GnodeB Sub6)
+        │         CUCP (entityType=CNF, subType=MACRO_SUB6_CU_CP, neType=CU-CP)
+        │         CUUP (entityType=CNF, subType=MACRO_SUB6_CU_UP, neType=CU-UP)
+        │         DU   (entityType=CNF, subType=MACRO_SUB6_DU,    neType=DU)
+        │       Relationships:
+        │         NS  -[NS_CONTAINS]→ CUCP, CUUP, DU
+        │         CUCP-[PARENT_OF]→  CUUP, DU
+        │
+        ├─ NS state → INSTANTIATION_IN_PROGRESS (Neo4j)
+        │
+        ├─ NsStateService.registerNsCnfs(nsId, [CUCP, CUUP, DU])
+        │
+        └─ for each CNF: publish INSTANTIATE + INSTANTIATION_COMPLETE (same key → ordered)
+           ──────────────────────────────────────────────────────────────────────────────────┐
+                                                                                             │
+Kafka: "lcm-commands"  ◄─────────────────────────────────────────────────────────────────────┘
+        │
+        │  Message 1 per CNF (INSTANTIATE):
+        ▼
+  LcmCommandConsumer.consume()
+        ├─ StateMachine: UNINSTANTIATED → INSTANTIATION_IN_PROGRESS
+        ├─ Neo4j: CNF state = INSTANTIATION_IN_PROGRESS  (idempotent)
+        ├─ AuditLog: MySQL record written
+        └─ NsStateService.onCnfStateChange(cnfId, INSTANTIATION_IN_PROGRESS)
+
+        │  Message 2 per CNF (INSTANTIATION_COMPLETE):
+        ▼
+  LcmCommandConsumer.consume()
+        ├─ StateMachine: INSTANTIATION_IN_PROGRESS → INSTANTIATED
+        ├─ Neo4j: CNF state = INSTANTIATED
+        ├─ AuditLog: MySQL record written
+        └─ NsStateService.onCnfStateChange(cnfId, INSTANTIATED)
+                    │
+                    └─ all 3 CNFs INSTANTIATED?
+                          │ YES
+                          ├─ NS state → INSTANTIATED (Neo4j)
+                          └─ publish NsCallbackEvent ─────────────────────────┐
+                                                                               │
+Kafka: "lcm-ns-callback"  ◄────────────────────────────────────────────────────┘
+        │
+        ▼
+  Site Management Kafka consumer
+        receives: { nsId, status:"INSTANTIATED", cnfStatuses:{...} }
+
+  ─────────────────────────────────────────────────────────
+  Failure path: POST /api/lcm/{cnfId}/fail
+  ─────────────────────────────────────────────────────────
+        │
+        ▼
+  NsStateService → NS state = INSTANTIATION_FAILED
+                 → publish NsCallbackEvent { status:"INSTANTIATION_FAILED" }
+```
 
 ---
 
 ## Architecture
 
 ```
-HTTP Request
-     │
-     ▼
-┌──────────────┐   publishes    ┌─────────────────┐
-│ LcmController│ ─────────────► │  Kafka Topic     │
-│              │   LcmCommand   │  lcm-commands    │
-└──────────────┘                └────────┬────────┘
-                                         │ @KafkaListener
-                                         ▼
-                               ┌──────────────────────┐
-                               │  LcmCommandConsumer  │
-                               │  (async processing)  │
-                               └──────────┬───────────┘
-                                          │
-                          ┌───────────────▼───────────────┐
-                          │     LcmStateMachineService     │
-                          │  (validates state transitions) │
-                          └──────────┬────────────────────┘
-                                     │
-              ┌──────────────────────┼────────────────────┐
-              ▼                      ▼                     ▼
-   ┌─────────────────┐   ┌──────────────────┐   ┌──────────────────┐
-   │  TopologyService│   │   AuditService   │   │  HTTP Response   │
-   │  (Neo4j graph)  │   │  (MySQL log)     │   │  202 Accepted    │
-   └─────────────────┘   └──────────────────┘   └──────────────────┘
+                  ┌──────────────────────────────────────────┐
+                  │           Site Management                │
+                  │         (IPTX / ZTP system)              │
+                  └──────┬───────────────────────────────────┘
+                         │ REST trigger               ▲ Kafka callback
+                         ▼                            │
+                  ┌──────────────┐          ┌─────────────────────┐
+                  │ LcmController│          │ "lcm-ns-callback"   │
+                  └──────┬───────┘          └─────────────────────┘
+                         │ publish                    ▲
+                         ▼                            │ NsStateService
+              ┌──────────────────────┐      ┌─────────────────────┐
+              │ "lcm-ns-create-      │      │  KafkaProducer      │
+              │  trigger" topic      │      │  Service            │
+              └──────────┬───────────┘      └─────────────────────┘
+                         │                            ▲
+                         ▼                            │
+              ┌──────────────────────┐      ┌─────────────────────┐
+              │  NsCreateConsumer    │─────►│  NsStateService     │
+              └──────────┬───────────┘      │  (tracks all 3 CNF  │
+                         │                  │   states per NS)    │
+              ┌──────────▼───────────┐      └─────────────────────┘
+              │  TopologyService     │                ▲
+              │  Neo4j: NS + CNFs +  │                │
+              │  relationships       │      ┌─────────┴───────────┐
+              └──────────┬───────────┘      │ LcmCommandConsumer  │
+                         │ publish × 3      └─────────────────────┘
+                         ▼                            ▲
+              ┌──────────────────────┐                │
+              │   "lcm-commands"     │────────────────┘
+              │   topic              │
+              └──────────────────────┘
 ```
-
-**Key design choice:** HTTP responds `202 Accepted` immediately. Actual state transition happens asynchronously via Kafka — the API never blocks on processing time.
 
 ---
 
-## LCM State Machine
+## Kafka Topics
+
+| Topic | Producer | Consumer | Purpose |
+|---|---|---|---|
+| `lcm-ns-create-trigger` | LcmController | NsCreateConsumer | NS instantiation trigger from Site Manager |
+| `lcm-commands` | LcmController, NsCreateConsumer | LcmCommandConsumer | Per-CNF LCM events |
+| `lcm-ns-callback` | NsStateService | Site Manager | NS result: INSTANTIATED / INSTANTIATION_FAILED |
+| `lcm-state-changes` | — | — | Reserved for future use |
+
+---
+
+## State Machine (CNF + NS)
+
+Same states apply to both individual CNFs and the NS as a whole.
 
 ```
-                   ┌──────────────────────────────────────────┐
-                   │          FAIL (from any active state)     │
-                   ▼                                           │
- ┌──────────────┐  INSTANTIATE  ┌─────────────┐               │
- │UNINSTANTIATED│ ────────────► │ INSTANTIATING│ ─────────────►┤
- └──────────────┘               └──────┬──────┘               │
-                                       │ INSTANTIATION_COMPLETE│  ┌────────┐
-                                       ▼                       │  │ FAILED │
-                                 ┌─────────┐                   │  └────────┘
-                      ┌──────────│ RUNNING │──────────┐        │
-                      │ SCALE    └─────────┘ TERMINATE│        │
-                      ▼                               ▼        │
-                 ┌─────────┐                 ┌────────────┐    │
-                 │ SCALING │                 │ TERMINATING│────┘
-                 └────┬────┘                 └─────┬──────┘
-                      │ SCALE_COMPLETE              │ TERMINATION_COMPLETE
-                      └──────► RUNNING             ▼
-                                             ┌────────────┐
-                                             │ TERMINATED │
-                                             └────────────┘
+                              INSTANTIATE
+ ┌───────────────┐  ─────────────────────────►  ┌─────────────────────────┐
+ │ UNINSTANTIATED│                               │ INSTANTIATION_IN_PROGRESS│
+ └───────────────┘                               └────────────┬────────────┘
+                                                              │               │
+                                              INSTANTIATION_  │          FAIL │
+                                              COMPLETE        │               ▼
+                                                              ▼        ┌──────────────────┐
+                                                       ┌─────────────┐ │ INSTANTIATION_   │
+                                             SCALE ◄───│ INSTANTIATED│ │ FAILED           │
+                                          TERMINATE ◄──└──────┬──────┘ └──────────────────┘
+                                                      ▲       │                  ▲
+                                               ┌──────┴──┐ ┌──▼──────────┐      │ FAIL
+                                               │ SCALING │ │ TERMINATING │──────┘
+                                               └────┬────┘ └──────┬──────┘
+                                      SCALE_COMPLETE │             │ TERMINATION_COMPLETE
+                                                     ▼             ▼
+                                               INSTANTIATED  ┌────────────┐
+                                                             │ TERMINATED │
+                                                             └────────────┘
 ```
 
-### Valid Transitions
+| State | Meaning |
+|---|---|
+| `UNINSTANTIATED` | Initial — CNF not yet deployed |
+| `INSTANTIATION_IN_PROGRESS` | INSTANTIATE fired — deploying now |
+| `INSTANTIATED` | Deployment complete — CNF is live |
+| `SCALING` | Scale operation running |
+| `TERMINATING` | Termination running |
+| `TERMINATED` | Permanently stopped |
+| `INSTANTIATION_FAILED` | Any FAIL event occurred |
 
-| Current State  | Event                  | Next State    |
-|----------------|------------------------|---------------|
-| UNINSTANTIATED | INSTANTIATE            | INSTANTIATING |
-| INSTANTIATING  | INSTANTIATION_COMPLETE | RUNNING       |
-| INSTANTIATING  | FAIL                   | FAILED        |
-| RUNNING        | SCALE                  | SCALING       |
-| RUNNING        | TERMINATE              | TERMINATING   |
-| SCALING        | SCALE_COMPLETE         | RUNNING       |
-| SCALING        | FAIL                   | FAILED        |
-| TERMINATING    | TERMINATION_COMPLETE   | TERMINATED    |
-| TERMINATING    | FAIL                   | FAILED        |
+**NS-level state** (stored in Neo4j, updated by `NsStateService`):
 
-Any unlisted event throws `IllegalStateException` — invalid transitions are rejected by design.
+| NS State | Trigger |
+|---|---|
+| `INSTANTIATION_IN_PROGRESS` | NS trigger received, CNFs deploying |
+| `INSTANTIATED` | All 3 CNFs reach `INSTANTIATED` |
+| `INSTANTIATION_FAILED` | Any CNF reaches `INSTANTIATION_FAILED` |
 
 ---
 
 ## Tech Stack
 
-| Layer       | Technology                      | Why                                              |
-|-------------|---------------------------------|--------------------------------------------------|
-| Backend     | Java 17, Spring Boot 3.2.3      | Industry standard, rich ecosystem                |
-| Messaging   | Apache Kafka 3.6 (KRaft)        | Async decoupling, durable command log            |
-| Graph DB    | Neo4j 5 Community               | Natural fit for dependency relationships         |
-| Relational  | MySQL 8.0                       | Structured audit logs, SQL queryable             |
-| Build       | Maven 3.9.6                     | Dependency management, lifecycle                 |
-| Testing     | JUnit 5, Mockito                | Unit + integration test coverage                 |
-| Container   | Docker, Docker Compose          | Zero-setup local dev                             |
-| K8s         | Kubernetes manifests            | Production deployment                            |
-| CI/CD       | GitHub Actions                  | Automated test gate on every push                |
-
----
-
-## Option 1: Run with Docker Compose (Recommended for local dev)
-
-### Prerequisites
-- Docker Desktop (Mac/Windows) or Docker Engine (Linux)
-- Nothing else — no local Java, Maven, or databases needed
-
-### Steps
-
-```bash
-# 1. Clone the repo
-git clone <repo-url>
-cd ctlm
-
-# 2. Start everything
-docker-compose up --build
-```
-
-Docker will:
-1. Build the app image using Maven inside Docker (downloads deps, compiles, packages JAR)
-2. Start MySQL, Neo4j, Kafka with health checks
-3. Wait for all three to be healthy before starting the app
-4. App is ready when you see: `Started CtlmApplication`
-
-First run: ~2-3 minutes (image pulls). Subsequent runs: ~30-60 seconds.
-
-### Service URLs (Docker)
-
-| Service       | URL                                    |
-|---------------|----------------------------------------|
-| REST API      | http://localhost:8080                  |
-| Health check  | http://localhost:8080/actuator/health  |
-| Neo4j Browser | http://localhost:7474                  |
-| MySQL         | localhost:3306 (user: root / root)     |
-
-### Stop
-
-```bash
-# Stop containers, keep data
-docker-compose down
-
-# Stop and wipe all data (fresh start)
-docker-compose down -v
-```
-
-### Port conflicts
-
-If you see `bind: address already in use`, one of these ports is taken on your machine:
-
-| Port | Service |
-|------|---------|
-| 8080 | App     |
-| 3306 | MySQL   |
-| 7474 | Neo4j HTTP |
-| 7687 | Neo4j Bolt |
-| 9092 | Kafka   |
-
-Fix: stop the conflicting local service, or change the host port in `docker-compose.yml` (left side of `ports:` mapping).
-
----
-
-## Option 2: Run on Kubernetes (Minikube)
-
-### Prerequisites
-- [Docker](https://docs.docker.com/get-docker/)
-- [Minikube](https://minikube.sigs.k8s.io/docs/start/)
-- [kubectl](https://kubernetes.io/docs/tasks/tools/)
-
-### Steps
-
-```bash
-# 1. Start minikube
-minikube start
-
-# 2. Point your local Docker to minikube's Docker daemon
-#    This lets minikube use locally built images without a registry
-eval $(minikube docker-env)
-
-# 3. Build the image inside minikube's Docker context
-docker build -t ctlm-app:latest .
-
-# 4. Apply all K8s manifests in order
-kubectl apply -f k8s/00-namespace.yaml
-kubectl apply -f k8s/01-mysql.yaml
-kubectl apply -f k8s/02-neo4j.yaml
-kubectl apply -f k8s/03-kafka.yaml
-kubectl apply -f k8s/04-app.yaml
-```
-
-### Watch startup progress
-
-```bash
-# Watch all pods come up (takes 2-4 minutes)
-kubectl get pods -n ctlm -w
-
-# What you should see eventually:
-# NAME                         READY   STATUS    RESTARTS
-# mysql-xxx                    1/1     Running   0
-# neo4j-xxx                    1/1     Running   0
-# kafka-xxx                    1/1     Running   0
-# ctlm-app-xxx                 1/1     Running   0
-```
-
-The `ctlm-app` pod has 3 initContainers that wait for MySQL, Kafka, and Neo4j ports to be reachable before starting the app.
-
-### Access the app
-
-```bash
-# Get the minikube URL for the app
-minikube service ctlm-app -n ctlm --url
-# Output: http://192.168.xx.xx:30080  ← use this as your base URL
-```
-
-Or use port-forward for direct access:
-
-```bash
-kubectl port-forward svc/ctlm-app 8080:8080 -n ctlm
-# App now at http://localhost:8080
-```
-
-### Access Neo4j Browser on K8s
-
-```bash
-kubectl port-forward svc/neo4j 7474:7474 7687:7687 -n ctlm
-# Browser at http://localhost:7474
-```
-
-### Teardown
-
-```bash
-# Delete all resources
-kubectl delete namespace ctlm
-
-# Or delete piece by piece
-kubectl delete -f k8s/
-```
-
-### Notes on K8s setup
-
-| Item | Detail |
-|------|--------|
-| `imagePullPolicy: Never` | Image must be built locally inside minikube's Docker context (step 2-3 above). If skipped, pod stays in `ErrImagePull`. |
-| Neo4j & Kafka storage | No PVC — data is ephemeral. Pod restart = data loss. Fine for dev/demo. |
-| MySQL storage | Has a 1Gi PVC — data survives pod restarts. |
-| Secrets | Passwords in ConfigMap as plaintext. Acceptable for dev; use `Secret` resource in production. |
-| App restart on init | If app pod restarts once (CrashLoopBackOff) on first deploy, that's normal — DB may need a few extra seconds after port opens. K8s will restart and it'll succeed. |
-
----
-
-## Test the API — Step by Step
-
-These commands work for both Docker (`localhost:8080`) and K8s (replace with your minikube URL).
-
-Set your base URL:
-```bash
-BASE=http://localhost:8080   # Docker
-# BASE=http://192.168.xx.xx:30080  # K8s
-```
-
-### Step 1 — Register CNFs in topology
-
-```bash
-curl -X POST $BASE/api/topology/cnf \
-  -H "Content-Type: application/json" \
-  -d '{"cnfId": "cnf-001", "name": "Sub6-NR-1", "type": "Sub6"}'
-
-curl -X POST $BASE/api/topology/cnf \
-  -H "Content-Type: application/json" \
-  -d '{"cnfId": "cnf-002", "name": "NGDU-1", "type": "NGDU"}'
-```
-
-### Step 2 — Define dependency
-
-```bash
-# cnf-002 depends on cnf-001
-curl -X POST $BASE/api/topology/cnf-002/dependencies/cnf-001
-```
-
-### Step 3 — Check initial state
-
-```bash
-curl $BASE/api/lcm/cnf-001/state
-# Expected: {"currentState":"UNINSTANTIATED"}
-```
-
-### Step 4 — Instantiate
-
-```bash
-curl -X POST $BASE/api/lcm/cnf-001/instantiate \
-  -H "Content-Type: application/json" \
-  -d '{"cnfId": "cnf-001", "cnfName": "Sub6-NR-1", "message": "Initial deployment"}'
-
-curl $BASE/api/lcm/cnf-001/state
-# Expected: INSTANTIATING
-```
-
-### Step 5 — Complete instantiation
-
-```bash
-curl -X POST $BASE/api/lcm/cnf-001/complete-instantiation
-
-curl $BASE/api/lcm/cnf-001/state
-# Expected: RUNNING
-```
-
-### Step 6 — Scale
-
-```bash
-curl -X POST $BASE/api/lcm/cnf-001/scale \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Scale out for peak load"}'
-
-curl -X POST $BASE/api/lcm/cnf-001/complete-scale
-
-curl $BASE/api/lcm/cnf-001/state
-# Expected: RUNNING (back from SCALING)
-```
-
-### Step 7 — Terminate
-
-```bash
-curl -X POST $BASE/api/lcm/cnf-001/terminate
-curl -X POST $BASE/api/lcm/cnf-001/complete-termination
-
-curl $BASE/api/lcm/cnf-001/state
-# Expected: TERMINATED
-```
-
-### Step 8 — View full audit trail
-
-```bash
-curl $BASE/api/lcm/cnf-001/history
-# Returns all transitions with timestamps, newest first
-```
-
-### Step 9 — Test invalid transition (should fail)
-
-```bash
-curl -X POST $BASE/api/lcm/cnf-001/scale \
-  -H "Content-Type: application/json" \
-  -d '{"message": "scale a terminated CNF - should be rejected"}'
-# Expected: error response — IllegalStateException
-```
-
-### Step 10 — View graph in Neo4j Browser
-
-1. Open http://localhost:7474 (Docker) or port-forward 7474 (K8s)
-2. No login needed (auth disabled in dev)
-3. Run: `MATCH (n:CnfNode) RETURN n` — all CNF nodes
-4. Run: `MATCH (a)-[r:DEPENDS_ON]->(b) RETURN a,r,b` — dependency graph
+| Layer | Technology | Purpose |
+|---|---|---|
+| Backend | Java 21, Spring Boot 3.2.3 | Core service |
+| Messaging | Apache Kafka | Async decoupling, durable command log |
+| Graph DB | Neo4j 5 | Topology: NS/CNF nodes + relationships |
+| Relational | MySQL 8 | Audit trail (every state transition) |
+| Build | Maven 3.9 | Dependency management |
+| Container | Docker, Docker Compose | Zero-setup local dev |
+| K8s | Kubernetes manifests | Production deployment |
+| CI/CD | GitHub Actions | Test gate on every push |
 
 ---
 
@@ -369,129 +247,477 @@ curl -X POST $BASE/api/lcm/cnf-001/scale \
 ```
 ctlm/
 ├── src/main/java/com/ctlm/
-│   ├── CtlmApplication.java           # Entry point (@SpringBootApplication)
+│   ├── CtlmApplication.java
 │   ├── controller/
-│   │   ├── LcmController.java         # /api/lcm — lifecycle commands
-│   │   └── TopologyController.java    # /api/topology — graph management
+│   │   ├── LcmController.java          # /api/lcm — lifecycle + NS trigger
+│   │   └── TopologyController.java     # /api/topology — graph management
 │   ├── statemachine/
-│   │   ├── LcmStateMachineService.java # Core FSM — ConcurrentHashMap + transitions map
-│   │   ├── LcmState.java              # 7 states enum
-│   │   └── LcmEvent.java              # 7 events enum
+│   │   ├── LcmStateMachineService.java # FSM: ConcurrentHashMap + transitions
+│   │   ├── LcmState.java               # UNINSTANTIATED|INSTANTIATION_IN_PROGRESS|INSTANTIATED|...
+│   │   └── LcmEvent.java               # INSTANTIATE|INSTANTIATION_COMPLETE|FAIL|...
 │   ├── topology/
-│   │   ├── TopologyService.java       # Neo4j CRUD + dependency management
-│   │   ├── CnfNode.java               # @Node entity with DEPENDS_ON relationship
-│   │   └── CnfNodeRepository.java     # Neo4jRepository
-│   ├── audit/
-│   │   ├── AuditService.java          # Logs every state transition
-│   │   ├── AuditLog.java              # @Entity — MySQL table lcm_audit_log
-│   │   └── AuditLogRepository.java    # JpaRepository with custom query
+│   │   ├── CnfNode.java                # @Node: entityType, subType, neType, characteristics
+│   │   │                               #   + PARENT_OF + NS_CONTAINS + DEPENDS_ON
+│   │   ├── CnfNodeRepository.java      # Cypher queries: findDirectParent, findNsParent, ...
+│   │   ├── TopologyService.java        # NS trigger, connectOut/In, addChild, addNsCnf
+│   │   └── NsStateService.java         # Tracks CNF states per NS, fires Kafka callback
 │   ├── kafka/
-│   │   ├── LcmCommandConsumer.java    # @KafkaListener — async command processor
-│   │   ├── KafkaProducerService.java  # KafkaTemplate wrapper
-│   │   └── LcmCommand.java            # Message POJO (cnfId, event, message)
+│   │   ├── LcmCommand.java             # Per-CNF command: {cnfId, event, message}
+│   │   ├── NsCallbackEvent.java        # NS result callback: {nsId, status, cnfStatuses}
+│   │   ├── KafkaProducerService.java   # publishCommand | publishNsCreateTrigger | publishNsCallback
+│   │   ├── LcmCommandConsumer.java     # "lcm-commands" listener → state machine + NsStateService
+│   │   └── NsCreateConsumer.java       # "lcm-ns-create-trigger" listener → creates topology
+│   ├── audit/
+│   │   ├── AuditService.java           # Logs every CNF state transition
+│   │   ├── AuditLog.java               # @Entity: MySQL table
+│   │   └── AuditLogRepository.java
 │   ├── dto/
-│   │   ├── LcmRequest.java            # POST body
-│   │   ├── LcmResponse.java           # API response
-│   │   └── CnfNodeRequest.java        # Topology registration body
+│   │   ├── NsTriggerRequest.java       # NS trigger body: nsId, name, nsType, characteristics[]
+│   │   ├── NsRequest.java              # Manual NS registration
+│   │   ├── EntityResponse.java         # Unified entity response: node + connectOut + connectIn
+│   │   ├── CnfNodeRequest.java
+│   │   ├── LcmRequest.java
+│   │   └── LcmResponse.java
 │   └── config/
-│       └── KafkaConfig.java           # Topic bean definitions
-├── src/test/java/com/ctlm/
-│   ├── CtlmApplicationTests.java      # Basic FSM tests
-│   └── statemachine/
-│       └── LcmStateMachineServiceTest.java  # Full transition matrix tests
+│       └── KafkaConfig.java            # 4 topic beans
 ├── k8s/
-│   ├── 00-namespace.yaml              # ctlm namespace
-│   ├── 01-mysql.yaml                  # MySQL Deployment + Service + PVC
-│   ├── 02-neo4j.yaml                  # Neo4j Deployment + Service
-│   ├── 03-kafka.yaml                  # Kafka Deployment + Service (KRaft)
-│   └── 04-app.yaml                    # App Deployment + Service + ConfigMap
-├── .github/workflows/ci.yml           # GitHub Actions — mvn test on push
-├── Dockerfile                         # Multi-stage: Maven builder + Alpine JRE
-└── docker-compose.yml                 # Full local stack with health checks
+│   ├── 00-namespace.yaml
+│   ├── 01-mysql.yaml
+│   ├── 02-neo4j.yaml
+│   ├── 03-kafka.yaml
+│   └── 04-app.yaml
+├── Dockerfile
+├── docker-compose.yml
+└── .github/workflows/ci.yml
 ```
 
 ---
 
-## Running Tests
+## Run Locally (Docker Compose)
 
 ```bash
-# If you have Maven locally
-mvn test
-
-# Without local Maven (Docker)
-docker run --rm -v $(pwd):/app -w /app maven:3.9-eclipse-temurin-17 mvn test
+git clone <repo-url> && cd ctlm
+docker-compose up --build
 ```
 
-Tests cover:
-- Initial state is `UNINSTANTIATED`
-- All 9 valid transitions
-- Full lifecycle sequence: instantiate → running → scale → terminate
-- Fail path from INSTANTIATING and SCALING
-- `IllegalStateException` on invalid transitions
-
----
-
-## Interview Talking Points
-
-### "Tell me about this project"
-
-> "CTLM manages the lifecycle of distributed resources — tracking them through states like UNINSTANTIATED, RUNNING, SCALING, TERMINATED. The core challenge is enforcing valid state transitions while keeping the API non-blocking.
->
-> I built it with a state machine for transition validation, Kafka for async decoupling, Neo4j for dependency graph, and MySQL for audit trail. It's fully containerized — Docker Compose for local dev, Kubernetes manifests for production. The API returns 202 immediately; the actual processing happens async via Kafka."
-
----
-
-### "Why Kafka instead of calling the state machine directly?"
-
-> "Two reasons: decoupling and durability. The controller doesn't need to know about the state machine internals. And if the consumer is temporarily down, the command stays in Kafka and gets processed when it recovers — a direct call would just fail and lose the command."
-
----
-
-### "Why Neo4j for topology?"
-
-> "Dependencies between resources are a graph problem. In MySQL I'd need a self-join table and recursive queries. In Neo4j a dependency is just a DEPENDS_ON relationship between nodes — and traversals like 'find everything that depends on this CNF' are a single Cypher query."
-
----
-
-### "How does the state machine work internally?"
-
-> "It's a ConcurrentHashMap keyed by CNF ID storing the current state. A static transitions map defines which events are valid from each state. When an event arrives via Kafka, I look up the current state, check if the event is valid, apply it, and persist. If the event isn't in the map for that state, I throw IllegalStateException. Simple, thread-safe, no external library."
-
----
-
-### "What design patterns did you use?"
-
-| Pattern | Where |
+| Service | URL |
 |---|---|
-| State Machine | `LcmStateMachineService` — all transition logic in one place |
-| Command Pattern | `LcmCommand` — serializable command sent over Kafka |
-| Repository Pattern | `AuditLogRepository`, `CnfNodeRepository` — data access abstraction |
-| DTO Pattern | `LcmRequest`, `LcmResponse` — clean API contracts, never expose entities |
+| REST API | http://localhost:8080 |
+| Health | http://localhost:8080/actuator/health |
+| Neo4j Browser | http://localhost:7474 |
+| MySQL | localhost:3306 (root/root) |
 
 ---
 
-### "What's a bug you fixed?"
+## All API Endpoints with curl
 
-> "When a CNF operation failed due to a missing implementation class, the state stayed INPROGRESS instead of transitioning to FAILED. Root cause: ClassNotFoundException was thrown before the catch block that publishes the FAILED event. I added an explicit catch for ClassNotFoundException that marks the state FAILED and publishes the failure event — same as what happens for runtime failures."
+Set your base URL once:
+```bash
+BASE=http://localhost:8080
+```
 
 ---
 
-### "How would you scale this in production?"
+### PING
 
-> "State is currently in-memory per instance. To run multiple replicas: move state to Redis — fast, distributed, survives restarts. Kafka already handles fanout with consumer groups. Neo4j and MySQL scale independently. After that the app is stateless — horizontal scaling is trivial. I'd also add a Dead Letter Queue for failed Kafka messages and Prometheus metrics on state transitions."
+```bash
+curl $BASE/api/lcm/ping
+# → ping Successfully
+```
+
+---
+
+### NS TRIGGER FLOW (Site Manager → CTLM)
+
+#### Step 1 — Site Manager fires the NS create trigger
+
+```bash
+curl -s -X POST $BASE/api/lcm/ns/trigger \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nsId"  : "ns-001",
+    "name"  : "uhn1tky817500083",
+    "nsType": "GnodeB Sub6",
+    "characteristics": [
+      {"name": "status",      "value": "INSTANTIATION_PENDING"},
+      {"name": "technology",  "value": "T5G"},
+      {"name": "vendor",      "value": "ALTIOSTAR"},
+      {"name": "domain",      "value": "RAN"},
+      {"name": "displayName", "value": "HELMSUB6JUN8"}
+    ]
+  }'
+# → 202 Accepted
+# {
+#   "cnfId": "ns-001",
+#   "currentState": "INSTANTIATION_IN_PROGRESS",
+#   "message": "NS create trigger accepted — processing asynchronously"
+# }
+```
+
+**What happens automatically in the background (no further calls needed):**
+1. Neo4j creates: NS node + CUCP + CUUP + DU, all with state `INSTANTIATION_IN_PROGRESS`
+2. NS_CONTAINS and PARENT_OF relationships set
+3. For each CNF: `INSTANTIATE` + `INSTANTIATION_COMPLETE` published to Kafka (same key → ordered)
+4. LcmCommandConsumer processes them: `UNINSTANTIATED → INSTANTIATION_IN_PROGRESS → INSTANTIATED`
+5. When all 3 CNFs reach `INSTANTIATED`: NS state → `INSTANTIATED`, callback fired to `lcm-ns-callback`
+
+Kafka message on `lcm-ns-callback`:
+```json
+{
+  "nsId": "ns-001",
+  "nsName": "uhn1tky817500083",
+  "nsType": "GnodeB Sub6",
+  "status": "INSTANTIATED",
+  "message": "All CNFs instantiated successfully",
+  "timestamp": "2026-07-21T10:30:00",
+  "cnfStatuses": {
+    "ns-001-macro-sub6-cu-cp": "INSTANTIATED",
+    "ns-001-macro-sub6-cu-up": "INSTANTIATED",
+    "ns-001-macro-sub6-du":    "INSTANTIATED"
+  }
+}
+```
+
+---
+
+#### Step 2 — Check NS instantiation status
+
+```bash
+curl -s $BASE/api/lcm/ns/ns-001/status
+# → {
+#     "ns-001-macro-sub6-cu-cp": "INSTANTIATED",
+#     "ns-001-macro-sub6-cu-up": "INSTANTIATED",
+#     "ns-001-macro-sub6-du":    "INSTANTIATED"
+#   }
+```
+
+---
+
+#### Failure scenario — mark a CNF as failed
+
+```bash
+# If CUUP fails during instantiation
+curl -s -X POST $BASE/api/lcm/ns-001-macro-sub6-cu-up/fail \
+  -H "Content-Type: application/json" \
+  -d '{"cnfName":"CUUP", "message":"Pod OOMKilled"}'
+
+# Kafka "lcm-ns-callback" receives:
+# { "status": "INSTANTIATION_FAILED", "message": "Instantiation failed for CNF: ns-001-macro-sub6-cu-up" }
+```
+
+---
+
+### NGDU_SUB6 NS TRIGGER
+
+Same 3-CNF flow as MacroSub6 — only the `nsType` and subType prefix differ.
+
+```bash
+curl -s -X POST $BASE/api/lcm/ns/trigger \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nsId"  : "ns-ngdu-001",
+    "name"  : "ngdu-node-001",
+    "nsType": "GnodeB NGDU_Sub6",
+    "characteristics": [
+      {"name": "technology", "value": "T5G"},
+      {"name": "vendor",     "value": "ALTIOSTAR"}
+    ]
+  }'
+# Creates:
+#   NS   (subType: GnodeB NGDU_Sub6)
+#   CUCP (subType: NGDU_SUB6_CU_CP, neType: CU-CP)  ← parent
+#   CUUP (subType: NGDU_SUB6_CU_UP, neType: CU-UP)  ← child of CUCP
+#   DU   (subType: NGDU_SUB6_DU,    neType: DU)      ← child of CUCP
+#
+# CNF IDs:
+#   ns-ngdu-001-ngdu-sub6-cu-cp
+#   ns-ngdu-001-ngdu-sub6-cu-up
+#   ns-ngdu-001-ngdu-sub6-du
+#
+# No further calls needed — INSTANTIATE + INSTANTIATION_COMPLETE auto-fired for each CNF.
+# → callback on "lcm-ns-callback": { "status": "INSTANTIATED", cnfStatuses: { ...all INSTANTIATED } }
+```
+
+---
+
+### INDIVIDUAL CNF LCM
+
+#### Get current state
+
+```bash
+curl -s $BASE/api/lcm/ns-001-macro-sub6-cu-cp/state
+# → { "cnfId": "ns-001-macro-sub6-cu-cp", "currentState": "INSTANTIATED" }
+```
+
+#### Instantiate manually
+
+```bash
+curl -s -X POST $BASE/api/lcm/cnf-001/instantiate \
+  -H "Content-Type: application/json" \
+  -d '{"cnfName":"MyNF", "message":"Manual deploy"}'
+```
+
+#### Scale
+
+```bash
+curl -s -X POST $BASE/api/lcm/cnf-001/scale \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Scale for peak load"}'
+
+curl -s -X POST $BASE/api/lcm/cnf-001/complete-scale
+```
+
+#### Terminate
+
+```bash
+curl -s -X POST $BASE/api/lcm/cnf-001/terminate
+curl -s -X POST $BASE/api/lcm/cnf-001/complete-termination
+```
+
+#### Audit history
+
+```bash
+curl -s $BASE/api/lcm/ns-001-macro-sub6-cu-cp/history
+# → [ { "fromState":"UNINSTANTIATED", "toState":"INSTANTIATION_IN_PROGRESS", "event":"INSTANTIATE", ... }, ... ]
+```
+
+---
+
+### TOPOLOGY — NS Management
+
+#### List all NS nodes
+
+```bash
+curl -s $BASE/api/topology/ns
+```
+
+#### Register an NS manually (no auto-CNF creation)
+
+```bash
+curl -s -X POST $BASE/api/topology/ns \
+  -H "Content-Type: application/json" \
+  -d '{"nsId":"ns-manual-001", "name":"Manual-NS-1"}'
+```
+
+#### Link a CNF under an NS manually
+
+```bash
+curl -s -X POST $BASE/api/topology/ns-manual-001/cnf/cucp-001
+```
+
+#### Set PARENT_OF manually (CUCP → CUUP)
+
+```bash
+curl -s -X POST $BASE/api/topology/cucp-001/child/cuup-001
+curl -s -X POST $BASE/api/topology/cucp-001/child/du-001
+```
+
+---
+
+### TOPOLOGY — CNF Management
+
+#### Register a CNF manually
+
+```bash
+curl -s -X POST $BASE/api/topology/cnf \
+  -H "Content-Type: application/json" \
+  -d '{"cnfId":"cucp-001", "name":"CUCP-Test", "type":"MACRO_SUB6_CU_CP"}'
+```
+
+#### Get raw CNF node
+
+```bash
+curl -s $BASE/api/topology/ns-001-macro-sub6-cu-cp
+```
+
+#### Legacy DEPENDS_ON
+
+```bash
+curl -s -X POST $BASE/api/topology/cnf-b/dependencies/cnf-a
+curl -s $BASE/api/topology/cnf-b/dependencies
+```
+
+---
+
+### TOPOLOGY — connect.CNF.out / connect.CNF.in
+
+#### connect.CNF.out — get parent
+
+```bash
+# CUUP → returns CUCP
+curl -s $BASE/api/topology/ns-001-macro-sub6-cu-up/connect/out
+
+# CUCP → returns NS
+curl -s $BASE/api/topology/ns-001-macro-sub6-cu-cp/connect/out
+
+# NS → 404 (no parent)
+curl -s $BASE/api/topology/ns-001/connect/out
+```
+
+#### connect.CNF.in — get children
+
+```bash
+# NS → [CUCP, CUUP, DU]
+curl -s $BASE/api/topology/ns-001/connect/in
+
+# CUCP → [CUUP, DU]
+curl -s $BASE/api/topology/ns-001-macro-sub6-cu-cp/connect/in
+
+# CUUP → []
+curl -s $BASE/api/topology/ns-001-macro-sub6-cu-up/connect/in
+```
+
+---
+
+### TOPOLOGY — Unified Entity Lookup
+
+Works for any ID — NS or CNF. Returns full details + connectOut + connectIn.
+
+```bash
+# Look up NS
+curl -s $BASE/api/topology/entity/ns-001
+# → {
+#     "id": "ns-001",
+#     "entityType": "NetworkService",
+#     "subType": "GnodeB Sub6",
+#     "currentState": "INSTANTIATED",
+#     "technology": "T5G",
+#     "vendor": "ALTIOSTAR",
+#     "characteristics": {"status":"INSTANTIATED", ...},
+#     "connectOut": null,
+#     "connectIn": [
+#       {"id":"ns-001-macro-sub6-cu-cp", "entityType":"CNF", "subType":"MACRO_SUB6_CU_CP", "neType":"CU-CP"},
+#       {"id":"ns-001-macro-sub6-cu-up", "entityType":"CNF", "subType":"MACRO_SUB6_CU_UP", "neType":"CU-UP"},
+#       {"id":"ns-001-macro-sub6-du",    "entityType":"CNF", "subType":"MACRO_SUB6_DU",    "neType":"DU"}
+#     ]
+#   }
+
+# Look up CUUP
+curl -s $BASE/api/topology/entity/ns-001-macro-sub6-cu-up
+# → {
+#     "id": "ns-001-macro-sub6-cu-up",
+#     "entityType": "CNF",
+#     "subType": "MACRO_SUB6_CU_UP",
+#     "neType": "CU-UP",
+#     "currentState": "INSTANTIATED",
+#     "connectOut": {"id":"ns-001-macro-sub6-cu-cp", "subType":"MACRO_SUB6_CU_CP", "neType":"CU-CP"},
+#     "connectIn": []
+#   }
+```
+
+---
+
+### NEO4J BROWSER QUERIES
+
+Open http://localhost:7474 (no login, auth disabled in dev).
+
+```cypher
+// All nodes
+MATCH (n:CnfNode) RETURN n
+
+// Full NS topology with relationships
+MATCH (ns:CnfNode {entityType:'NetworkService'})-[r]->(c:CnfNode)
+RETURN ns, r, c
+
+// PARENT_OF hierarchy
+MATCH (cucp:CnfNode)-[r:PARENT_OF]->(child:CnfNode)
+RETURN cucp, r, child
+
+// Find all CNFs under a specific NS
+MATCH (ns:CnfNode {cnfId:'ns-001'})-[:NS_CONTAINS]->(c:CnfNode)
+RETURN c.cnfId, c.subType, c.neType, c.currentState
+
+// connect.CNF.out — find parent of CUUP
+MATCH (p:CnfNode)-[:PARENT_OF]->(c:CnfNode {cnfId:'ns-001-macro-sub6-cu-up'})
+RETURN p
+
+// All NS nodes and their states
+MATCH (n:CnfNode {entityType:'NetworkService'})
+RETURN n.cnfId, n.name, n.subType, n.currentState
+```
+
+---
+
+## Invalid Transition Test
+
+```bash
+# Put cnf-001 in INSTANTIATED state first
+curl -s -X POST $BASE/api/lcm/cnf-001/instantiate
+curl -s -X POST $BASE/api/lcm/cnf-001/complete-instantiation
+
+# Try to instantiate again — should be rejected (INSTANTIATED + INSTANTIATE is invalid)
+curl -s -X POST $BASE/api/lcm/cnf-001/instantiate
+# → Kafka consumer logs: "Invalid state transition for cnfId=cnf-001: state=INSTANTIATED, event=INSTANTIATE"
+```
 
 ---
 
 ## Environment Variables
 
-| Variable                | Default        | Purpose               |
-|-------------------------|----------------|-----------------------|
-| MYSQL_HOST              | localhost      | MySQL hostname        |
-| MYSQL_PORT              | 3306           | MySQL port            |
-| MYSQL_DB                | ctlmdb         | Database name         |
-| MYSQL_USER              | root           | MySQL username        |
-| MYSQL_PASSWORD          | root           | MySQL password        |
-| NEO4J_HOST              | localhost      | Neo4j hostname        |
-| NEO4J_PORT              | 7687           | Neo4j Bolt port       |
-| NEO4J_PASSWORD          | (empty)        | Neo4j password        |
-| KAFKA_BOOTSTRAP_SERVERS | localhost:9092 | Kafka broker address  |
+| Variable | Default | Purpose |
+|---|---|---|
+| `MYSQL_HOST` | localhost | MySQL hostname |
+| `MYSQL_PORT` | 3306 | MySQL port |
+| `MYSQL_DB` | ctlmdb | Database name |
+| `MYSQL_USER` | root | MySQL username |
+| `MYSQL_PASSWORD` | root | MySQL password |
+| `NEO4J_HOST` | localhost | Neo4j hostname |
+| `NEO4J_PORT` | 7687 | Neo4j Bolt port |
+| `NEO4J_PASSWORD` | (empty) | Neo4j password |
+| `KAFKA_BOOTSTRAP_SERVERS` | localhost:9092 | Kafka broker |
+
+---
+
+## Run Tests
+
+```bash
+mvn test
+```
+
+---
+
+## K8s Deployment (Minikube)
+
+```bash
+minikube start
+eval $(minikube docker-env)
+docker build -t ctlm-app:latest .
+
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/01-mysql.yaml
+kubectl apply -f k8s/02-neo4j.yaml
+kubectl apply -f k8s/03-kafka.yaml
+kubectl apply -f k8s/04-app.yaml
+
+# Watch pods come up
+kubectl get pods -n ctlm -w
+
+# Access the app
+minikube service ctlm-app -n ctlm --url
+```
+
+---
+
+## Interview Talking Points
+
+**"Tell me about this project"**
+> CTLM is a lifecycle manager for 5G CNFs. When Site Management triggers an NS create, CTLM auto-creates the NS and all child CNFs (CUCP, CUUP, DU) with correct topology relationships in Neo4j, then fires INSTANTIATE and INSTANTIATION_COMPLETE for each CNF via Kafka automatically. It tracks the state of every CNF independently, and when all three reach INSTANTIATED, it fires a callback to Site Management. The API returns 202 immediately — all processing is async via Kafka.
+
+**"Why Kafka?"**
+> Decoupling and durability. The REST call completes in milliseconds. If the consumer is down, the message stays in Kafka and processes when it recovers. Direct calls would block and lose the command on failure.
+
+**"Why Neo4j?"**
+> The NS/CNF hierarchy is a graph: NS contains CUCP, CUUP, DU; CUCP is parent of CUUP and DU. In MySQL this would require self-join tables and recursive queries. In Neo4j, traversals like "give me the parent of this CNF" or "give me all CNFs under this NS" are single Cypher queries.
+
+**"How does NsStateService work?"**
+> It keeps an in-memory ConcurrentHashMap of `nsId → {cnfId → LcmState}`. Every time LcmCommandConsumer transitions a CNF state, it calls `onCnfStateChange()`. When all CNFs reach INSTANTIATED, it atomically marks the callback as sent (preventing duplicates) and publishes the result to Kafka.
+
+**Design patterns used:**
+
+| Pattern | Where |
+|---|---|
+| State Machine | `LcmStateMachineService` |
+| Command Pattern | `LcmCommand` over Kafka |
+| Observer | `NsStateService` watching CNF state changes |
+| Repository | `CnfNodeRepository`, `AuditLogRepository` |
+| DTO | `NsTriggerRequest`, `EntityResponse`, `NsCallbackEvent` |

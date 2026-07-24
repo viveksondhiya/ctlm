@@ -15,79 +15,99 @@ class LcmStateMachineServiceTest {
     }
 
     @Test
-    void testValidTransition_UninstantiatedToInstantiating() {
-        String cnfId = "cnf-001";
-        assertEquals(LcmState.UNINSTANTIATED, stateMachineService.getCurrentState(cnfId));
-
-        LcmState newState = stateMachineService.applyEvent(cnfId, LcmEvent.INSTANTIATE);
-
-        assertEquals(LcmState.INSTANTIATING, newState);
-        assertEquals(LcmState.INSTANTIATING, stateMachineService.getCurrentState(cnfId));
+    void testInitialState_IsUninstantiated() {
+        assertEquals(LcmState.UNINSTANTIATED, stateMachineService.getCurrentState("cnf-new"));
     }
 
     @Test
-    void testValidSequence_FullInstantiateAndScaleFlow() {
-        String cnfId = "cnf-002";
+    void testInstantiate_UninstantiatedToInstantiationInProgress() {
+        LcmState next = stateMachineService.applyEvent("cnf-001", LcmEvent.INSTANTIATE);
+        assertEquals(LcmState.INSTANTIATION_IN_PROGRESS, next);
+        assertEquals(LcmState.INSTANTIATION_IN_PROGRESS, stateMachineService.getCurrentState("cnf-001"));
+    }
 
-        stateMachineService.applyEvent(cnfId, LcmEvent.INSTANTIATE);
-        assertEquals(LcmState.INSTANTIATING, stateMachineService.getCurrentState(cnfId));
+    @Test
+    void testInstantiationComplete_InProgressToInstantiated() {
+        stateMachineService.applyEvent("cnf-002", LcmEvent.INSTANTIATE);
+        LcmState next = stateMachineService.applyEvent("cnf-002", LcmEvent.INSTANTIATION_COMPLETE);
+        assertEquals(LcmState.INSTANTIATED, next);
+    }
 
-        stateMachineService.applyEvent(cnfId, LcmEvent.INSTANTIATION_COMPLETE);
-        assertEquals(LcmState.RUNNING, stateMachineService.getCurrentState(cnfId));
+    @Test
+    void testFullFlow_InstantiateScaleTerminate() {
+        String id = "cnf-003";
 
-        stateMachineService.applyEvent(cnfId, LcmEvent.SCALE);
-        assertEquals(LcmState.SCALING, stateMachineService.getCurrentState(cnfId));
+        stateMachineService.applyEvent(id, LcmEvent.INSTANTIATE);
+        assertEquals(LcmState.INSTANTIATION_IN_PROGRESS, stateMachineService.getCurrentState(id));
+
+        stateMachineService.applyEvent(id, LcmEvent.INSTANTIATION_COMPLETE);
+        assertEquals(LcmState.INSTANTIATED, stateMachineService.getCurrentState(id));
+
+        stateMachineService.applyEvent(id, LcmEvent.SCALE);
+        assertEquals(LcmState.SCALING, stateMachineService.getCurrentState(id));
+
+        stateMachineService.applyEvent(id, LcmEvent.SCALE_COMPLETE);
+        assertEquals(LcmState.INSTANTIATED, stateMachineService.getCurrentState(id));
+
+        stateMachineService.applyEvent(id, LcmEvent.TERMINATE);
+        assertEquals(LcmState.TERMINATING, stateMachineService.getCurrentState(id));
+
+        stateMachineService.applyEvent(id, LcmEvent.TERMINATION_COMPLETE);
+        assertEquals(LcmState.TERMINATED, stateMachineService.getCurrentState(id));
+    }
+
+    @Test
+    void testFail_InProgressToInstantiationFailed() {
+        stateMachineService.applyEvent("cnf-004", LcmEvent.INSTANTIATE);
+        LcmState failed = stateMachineService.applyEvent("cnf-004", LcmEvent.FAIL);
+        assertEquals(LcmState.INSTANTIATION_FAILED, failed);
+    }
+
+    @Test
+    void testFail_DuringScaling() {
+        String id = "cnf-005";
+        stateMachineService.applyEvent(id, LcmEvent.INSTANTIATE);
+        stateMachineService.applyEvent(id, LcmEvent.INSTANTIATION_COMPLETE);
+        stateMachineService.applyEvent(id, LcmEvent.SCALE);
+        LcmState failed = stateMachineService.applyEvent(id, LcmEvent.FAIL);
+        assertEquals(LcmState.INSTANTIATION_FAILED, failed);
     }
 
     @Test
     void testInvalidTransition_ThrowsIllegalStateException() {
-        String cnfId = "cnf-003";
-
+        // UNINSTANTIATED + SCALE_COMPLETE = invalid
         assertThrows(IllegalStateException.class, () ->
-            stateMachineService.applyEvent(cnfId, LcmEvent.SCALE_COMPLETE)
+            stateMachineService.applyEvent("cnf-006", LcmEvent.SCALE_COMPLETE)
         );
     }
 
     @Test
-    void testFailTransition_InstantiatingToFailed() {
-        String cnfId = "cnf-004";
-
-        stateMachineService.applyEvent(cnfId, LcmEvent.INSTANTIATE);
-        assertEquals(LcmState.INSTANTIATING, stateMachineService.getCurrentState(cnfId));
-
-        LcmState failedState = stateMachineService.applyEvent(cnfId, LcmEvent.FAIL);
-        assertEquals(LcmState.FAILED, failedState);
-        assertEquals(LcmState.FAILED, stateMachineService.getCurrentState(cnfId));
+    void testInvalidTransition_CannotInstantiateWhenAlreadyInstantiated() {
+        String id = "cnf-007";
+        stateMachineService.applyEvent(id, LcmEvent.INSTANTIATE);
+        stateMachineService.applyEvent(id, LcmEvent.INSTANTIATION_COMPLETE);
+        // INSTANTIATED + INSTANTIATE = invalid
+        assertThrows(IllegalStateException.class, () ->
+            stateMachineService.applyEvent(id, LcmEvent.INSTANTIATE)
+        );
     }
 
     @Test
-    void testIsValidTransition_ReturnsTrueForValid() {
-        assertTrue(stateMachineService.isValidTransition(LcmState.UNINSTANTIATED, LcmEvent.INSTANTIATE));
-        assertTrue(stateMachineService.isValidTransition(LcmState.INSTANTIATING, LcmEvent.INSTANTIATION_COMPLETE));
-        assertTrue(stateMachineService.isValidTransition(LcmState.RUNNING, LcmEvent.SCALE));
-        assertTrue(stateMachineService.isValidTransition(LcmState.RUNNING, LcmEvent.TERMINATE));
-        assertTrue(stateMachineService.isValidTransition(LcmState.SCALING, LcmEvent.SCALE_COMPLETE));
-        assertTrue(stateMachineService.isValidTransition(LcmState.TERMINATING, LcmEvent.TERMINATION_COMPLETE));
+    void testIsValidTransition_ValidCases() {
+        assertTrue(stateMachineService.isValidTransition(LcmState.UNINSTANTIATED,            LcmEvent.INSTANTIATE));
+        assertTrue(stateMachineService.isValidTransition(LcmState.INSTANTIATION_IN_PROGRESS, LcmEvent.INSTANTIATION_COMPLETE));
+        assertTrue(stateMachineService.isValidTransition(LcmState.INSTANTIATION_IN_PROGRESS, LcmEvent.FAIL));
+        assertTrue(stateMachineService.isValidTransition(LcmState.INSTANTIATED,              LcmEvent.SCALE));
+        assertTrue(stateMachineService.isValidTransition(LcmState.INSTANTIATED,              LcmEvent.TERMINATE));
+        assertTrue(stateMachineService.isValidTransition(LcmState.SCALING,                   LcmEvent.SCALE_COMPLETE));
+        assertTrue(stateMachineService.isValidTransition(LcmState.TERMINATING,               LcmEvent.TERMINATION_COMPLETE));
     }
 
     @Test
-    void testIsValidTransition_ReturnsFalseForInvalid() {
-        assertFalse(stateMachineService.isValidTransition(LcmState.UNINSTANTIATED, LcmEvent.SCALE_COMPLETE));
-        assertFalse(stateMachineService.isValidTransition(LcmState.RUNNING, LcmEvent.INSTANTIATE));
-        assertFalse(stateMachineService.isValidTransition(LcmState.TERMINATED, LcmEvent.SCALE));
-        assertFalse(stateMachineService.isValidTransition(LcmState.FAILED, LcmEvent.TERMINATE));
-    }
-
-    @Test
-    void testTerminateFlow() {
-        String cnfId = "cnf-005";
-
-        stateMachineService.applyEvent(cnfId, LcmEvent.INSTANTIATE);
-        stateMachineService.applyEvent(cnfId, LcmEvent.INSTANTIATION_COMPLETE);
-        stateMachineService.applyEvent(cnfId, LcmEvent.TERMINATE);
-        assertEquals(LcmState.TERMINATING, stateMachineService.getCurrentState(cnfId));
-
-        LcmState terminated = stateMachineService.applyEvent(cnfId, LcmEvent.TERMINATION_COMPLETE);
-        assertEquals(LcmState.TERMINATED, terminated);
+    void testIsValidTransition_InvalidCases() {
+        assertFalse(stateMachineService.isValidTransition(LcmState.UNINSTANTIATED,  LcmEvent.SCALE_COMPLETE));
+        assertFalse(stateMachineService.isValidTransition(LcmState.INSTANTIATED,    LcmEvent.INSTANTIATE));
+        assertFalse(stateMachineService.isValidTransition(LcmState.TERMINATED,      LcmEvent.SCALE));
+        assertFalse(stateMachineService.isValidTransition(LcmState.INSTANTIATION_FAILED, LcmEvent.TERMINATE));
     }
 }
