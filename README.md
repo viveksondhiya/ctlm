@@ -6,7 +6,7 @@ A production-style Spring Boot microservice that manages the full lifecycle of *
 
 ## What It Does
 
-When **Site Management** (IPTX / ZTP) creates a Network Slice (NS), CTLM:
+When **Site Management** (IPTX / ZTP) creates a Network Service (NS), CTLM:
 
 1. Receives the NS create trigger via REST → publishes to Kafka
 2. Creates the NS and all child CNFs in Neo4j (`INSTANTIATION_IN_PROGRESS`) with characteristics and relationships
