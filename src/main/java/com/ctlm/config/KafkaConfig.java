@@ -37,4 +37,13 @@ public class KafkaConfig {
     public NewTopic lcmNsCallbackTopic() {
         return TopicBuilder.name("lcm-ns-callback").partitions(3).replicas(1).build();
     }
+
+    /**
+
+     * Published Ns Terminate Trigger all CNFs with NS.
+     */
+    @Bean
+    public NewTopic lcmNsTerminateTriggerTopic() {
+        return TopicBuilder.name("lcm-ns-terminate-trihher").partitions(3).replicas(1).build();
+    }
 }

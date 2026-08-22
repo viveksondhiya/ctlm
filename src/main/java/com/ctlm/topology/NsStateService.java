@@ -43,6 +43,13 @@ public class NsStateService {
     /** nsIds for which callback has already been sent (prevents duplicates) */
     private final Set<String> callbackSent = ConcurrentHashMap.newKeySet();
 
+    /** nsId → { cnfId → LcmState } — for termination tracking */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, LcmState>> nsTerminationTracker
+            = new ConcurrentHashMap<>();
+
+    /** nsIds for which termination callback already sent */
+    private final Set<String> terminationCallbackSent = ConcurrentHashMap.newKeySet();
+
     // ──────────────────────────────────────────────────────────
     //  Registration — called from NsCreateConsumer
     // ──────────────────────────────────────────────────────────
@@ -62,6 +69,17 @@ public class NsStateService {
         log.info("Registered NS {} with {} CNFs for state tracking", nsId, cnfs.size());
     }
 
+    public void registerNsTermination(String nsId, List<Cnf> cnfs) {
+        ConcurrentHashMap<String, LcmState> stateMap = new ConcurrentHashMap<>();
+        for (Cnf cnf : cnfs) {
+            stateMap.put(cnf.getCnfId(), LcmState.TERMINATING);
+            cnfToNs.put(cnf.getCnfId(), nsId);
+        }
+        nsTerminationTracker.put(nsId, stateMap);
+        terminationCallbackSent.remove(nsId);
+        log.info("Registered NS {} with {} CNFs for termination tracking", nsId, cnfs.size());
+    }
+
     // ──────────────────────────────────────────────────────────
     //  State change hook — called from LcmCommandConsumer
     // ──────────────────────────────────────────────────────────
@@ -74,6 +92,35 @@ public class NsStateService {
      *   INSTANTIATED        — all CNFs are RUNNING
      *   INSTANTIATION_FAILED — at least one CNF is FAILED
      */
+//    public void onCnfStateChange(String cnfId, LcmState newState) {
+//        String nsId = cnfToNs.get(cnfId);
+//        if (nsId == null) {
+//            log.debug("CNF {} not tracked by any NS — skipping NS state check", cnfId);
+//            return;
+//        }
+//
+//        ConcurrentHashMap<String, LcmState> cnfStates = nsTracker.get(nsId);
+//        if (cnfStates == null || !cnfStates.containsKey(cnfId)) {
+//            log.debug("CNF {} not in NS {} tracker map", cnfId, nsId);
+//            return;
+//        }
+//
+//        cnfStates.put(cnfId, newState);
+//        log.info("NS {} | CNF {} → {} | all states: {}", nsId, cnfId, newState, cnfStates);
+//
+//        // skip if callback already sent for this NS
+//        if (callbackSent.contains(nsId)) return;
+//
+//        if (newState == LcmState.INSTANTIATION_FAILED) {
+//            // Any failure → NS fails immediately
+//            fireCallback(nsId, cnfStates, "INSTANTIATION_FAILED", "Instantiation failed for CNF: " + cnfId);
+//        } else if (allInstantiated(cnfStates)) {
+//            // All CNFs instantiated successfully
+//            fireCallback(nsId, cnfStates, "INSTANTIATED",
+//                "All CNFs instantiated successfully");
+//        }
+//    }
+
     public void onCnfStateChange(String cnfId, LcmState newState) {
         String nsId = cnfToNs.get(cnfId);
         if (nsId == null) {
@@ -81,27 +128,36 @@ public class NsStateService {
             return;
         }
 
+        // Instantiation tracking
         ConcurrentHashMap<String, LcmState> cnfStates = nsTracker.get(nsId);
-        if (cnfStates == null || !cnfStates.containsKey(cnfId)) {
-            log.debug("CNF {} not in NS {} tracker map", cnfId, nsId);
-            return;
+        if (cnfStates != null && cnfStates.containsKey(cnfId)) {
+            cnfStates.put(cnfId, newState);
+            log.info("NS {} | CNF {} → {} | instantiation states: {}", nsId, cnfId, newState, cnfStates);
+            if (!callbackSent.contains(nsId)) {
+                if (newState == LcmState.INSTANTIATION_FAILED) {
+                    fireCallback(nsId, cnfStates, "INSTANTIATION_FAILED",
+                            "Instantiation failed for CNF: " + cnfId);
+                } else if (allInstantiated(cnfStates)) {
+                    fireCallback(nsId, cnfStates, "INSTANTIATED",
+                            "All CNFs instantiated successfully");
+                }
+            }
         }
 
-        cnfStates.put(cnfId, newState);
-        log.info("NS {} | CNF {} → {} | all states: {}", nsId, cnfId, newState, cnfStates);
-
-        // skip if callback already sent for this NS
-        if (callbackSent.contains(nsId)) return;
-
-        if (newState == LcmState.INSTANTIATION_FAILED) {
-            // Any failure → NS fails immediately
-            fireCallback(nsId, cnfStates, "INSTANTIATION_FAILED",
-                "Instantiation failed for CNF: " + cnfId);
-
-        } else if (allInstantiated(cnfStates)) {
-            // All CNFs instantiated successfully
-            fireCallback(nsId, cnfStates, "INSTANTIATED",
-                "All CNFs instantiated successfully");
+        // Termination tracking
+        ConcurrentHashMap<String, LcmState> termStates = nsTerminationTracker.get(nsId);
+        if (termStates != null && termStates.containsKey(cnfId)) {
+            termStates.put(cnfId, newState);
+            log.info("NS {} | CNF {} → {} | termination states: {}", nsId, cnfId, newState, termStates);
+            if (!terminationCallbackSent.contains(nsId)) {
+                if (newState == LcmState.INSTANTIATION_FAILED) {
+                    fireTerminationCallback(nsId, termStates, "TERMINATION_FAILED",
+                            "Termination failed for CNF: " + cnfId);
+                } else if (allTerminated(termStates)) {
+                    fireTerminationCallback(nsId, termStates, "TERMINATED",
+                            "All CNFs terminated successfully");
+                }
+            }
         }
     }
 
@@ -115,6 +171,7 @@ public class NsStateService {
      */
     public Map<String, String> getNsInstantiationStatus(String nsId) {
         ConcurrentHashMap<String, LcmState> states = nsTracker.get(nsId);
+        log.info("getNsInstantiationStatus for ns id : {} and hte states is : {} ",nsId,states);
         if (states == null) return Collections.emptyMap();
         Map<String, String> result = new LinkedHashMap<>();
         states.forEach((cnfId, state) -> result.put(cnfId, state.name()));
@@ -130,8 +187,37 @@ public class NsStateService {
             && states.values().stream().allMatch(s -> s == LcmState.INSTANTIATED);
     }
 
-    private void fireCallback(String nsId, Map<String, LcmState> cnfStates,
-                              String status, String message) {
+    private boolean allTerminated(Map<String, LcmState> states) {
+        return !states.isEmpty()
+                && states.values().stream().allMatch(s -> s == LcmState.TERMINATED);
+    }
+
+    private void fireTerminationCallback(String nsId, Map<String, LcmState> cnfStates,
+                                         String status, String message) {
+        if (!terminationCallbackSent.add(nsId)) return;
+
+        topologyService.updateState(nsId, status);
+        log.info("NS {} state → {}", nsId, status);
+
+        Map<String, String> cnfStatusMap = new LinkedHashMap<>();
+        cnfStates.forEach((id, s) -> cnfStatusMap.put(id, s.name()));
+
+        Cnf ns = topologyService.getCnf(nsId).orElse(null);
+        String nsName = ns != null ? ns.getName()    : nsId;
+        String nsType = ns != null ? ns.getSubType() : "UNKNOWN";
+
+        NsCallbackEvent event = new NsCallbackEvent(
+                nsId, nsName, nsType,
+                status, message,
+                LocalDateTime.now(),
+                cnfStatusMap
+        );
+
+        kafkaProducerService.publishNsCallback(event);
+        log.info("NS termination callback published: nsId={}, status={}", nsId, status);
+    }
+
+    private void fireCallback(String nsId, Map<String, LcmState> cnfStates, String status, String message) {
         // Atomic: only one thread fires the callback
         if (!callbackSent.add(nsId)) return;
 
@@ -148,12 +234,7 @@ public class NsStateService {
         String nsName = ns != null ? ns.getName()    : nsId;
         String nsType = ns != null ? ns.getSubType() : "UNKNOWN";
 
-        NsCallbackEvent event = new NsCallbackEvent(
-            nsId, nsName, nsType,
-            status, message,
-            LocalDateTime.now(),
-            cnfStatusMap
-        );
+        NsCallbackEvent event = new NsCallbackEvent(nsId, nsName, nsType, status, message, LocalDateTime.now(), cnfStatusMap);
 
         kafkaProducerService.publishNsCallback(event);
         log.info("NS callback published: nsId={}, status={}", nsId, status);

@@ -69,6 +69,10 @@ public class LcmStateMachineService {
         return stateMap.getOrDefault(cnfId, LcmState.UNINSTANTIATED);
     }
 
+    public void forceState(String cnfId,LcmState lcmState) {
+        stateMap.put(cnfId,lcmState);
+    }
+
     public LcmState applyEvent(String cnfId, LcmEvent event) {
         LcmState current = getCurrentState(cnfId);
         if (!isValidTransition(current, event)) {

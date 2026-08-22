@@ -10,6 +10,7 @@ import com.ctlm.kafka.LcmCommand;
 import com.ctlm.statemachine.LcmEvent;
 import com.ctlm.statemachine.LcmStateMachineService;
 import com.ctlm.topology.NsStateService;
+import com.ctlm.topology.TopologyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -29,6 +30,7 @@ public class LcmController {
     private final LcmStateMachineService stateMachineService;
     private final AuditService auditService;
     private final NsStateService nsStateService;
+    private final TopologyService topologyService;
 
     @GetMapping("/ping")
     public String ping() {
@@ -41,25 +43,25 @@ public class LcmController {
 
     /**
      * Site Manager calls this to kick off NS instantiation.
-     *
+     * <p>
      * What happens:
-     *   1. Request published to Kafka "lcm-ns-create-trigger"
-     *   2. NsCreateConsumer picks it up → creates NS + 3 CNFs in Neo4j
-     *   3. INSTANTIATE command fired for each CNF
-     *   4. When all 3 CNFs reach RUNNING → callback published to "lcm-ns-callback"
-     *   5. Site Manager consumes callback and sees INSTANTIATED / INSTANTIATION_FAILED
-     *
+     * 1. Request published to Kafka "lcm-ns-create-trigger"
+     * 2. NsCreateConsumer picks it up → creates NS + 3 CNFs in Neo4j
+     * 3. INSTANTIATE command fired for each CNF
+     * 4. When all 3 CNFs reach RUNNING → callback published to "lcm-ns-callback"
+     * 5. Site Manager consumes callback and sees INSTANTIATED / INSTANTIATION_FAILED
+     * <p>
      * POST /api/lcm/ns/trigger
      * Body: { "nsId":"...", "name":"...", "nsType":"GnodeB Sub6",
-     *          "characteristics":[{"name":"status","value":"INSTANTIATION_FAILED"},...] }
+     * "characteristics":[{"name":"status","value":"INSTANTIATION_FAILED"},...] }
      */
     @PostMapping("/ns/trigger")
     public ResponseEntity<LcmResponse> triggerNsCreate(@RequestBody NsTriggerRequest request) {
-        log.info("NS create trigger received from Site Manager:{}",request);
+        log.info("NS create trigger received from Site Manager:{}", request);
         kafkaProducerService.publishNsCreateTrigger(request);
         return ResponseEntity.accepted().body(
-            new LcmResponse(request.getNsId(), "INSTANTIATION_IN_PROGRESS",
-                    "NS create trigger accepted — processing asynchronously", LocalDateTime.now())
+                new LcmResponse(request.getNsId(), "INSTANTIATION_IN_PROGRESS",
+                        "NS create trigger accepted — processing asynchronously", LocalDateTime.now())
         );
     }
 
@@ -86,7 +88,7 @@ public class LcmController {
         String message = request != null ? request.getMessage() : "Instantiate requested";
         kafkaProducerService.publishCommand(new LcmCommand(cnfId, cnfName, LcmEvent.INSTANTIATE, message));
         return ResponseEntity.accepted().body(
-            new LcmResponse(cnfId, "INSTANTIATION_IN_PROGRESS", "Instantiate command accepted", LocalDateTime.now()));
+                new LcmResponse(cnfId, "INSTANTIATION_IN_PROGRESS", "Instantiate command accepted", LocalDateTime.now()));
     }
 
     @PostMapping("/{cnfId}/scale")
@@ -95,17 +97,38 @@ public class LcmController {
         String message = request != null ? request.getMessage() : "Scale requested";
         kafkaProducerService.publishCommand(new LcmCommand(cnfId, cnfName, LcmEvent.SCALE, message));
         return ResponseEntity.accepted().body(
-            new LcmResponse(cnfId, "SCALING", "Scale command accepted", LocalDateTime.now()));
+                new LcmResponse(cnfId, "SCALING", "Scale command accepted", LocalDateTime.now()));
     }
 
     @PostMapping("/{cnfId}/terminate")
     public ResponseEntity<LcmResponse> terminate(@PathVariable String cnfId,
-                                                  @RequestBody(required = false) LcmRequest request) {
+                                                 @RequestBody(required = false) LcmRequest request) {
         String cnfName = request != null ? request.getCnfName() : cnfId;
         String message = request != null ? request.getMessage() : "Terminate requested";
         kafkaProducerService.publishCommand(new LcmCommand(cnfId, cnfName, LcmEvent.TERMINATE, message));
         return ResponseEntity.accepted().body(
+                new LcmResponse(cnfId, "TERMINATING", "Terminate command accepted", LocalDateTime.now()));
+    }
+
+    @PostMapping("/{cnfId}/single-cnf-terminate")
+    public ResponseEntity<LcmResponse> cnfTerminate(@PathVariable String cnfId,
+                                                 @RequestBody(required = false) LcmRequest request) {
+        String cnfName = request != null ? request.getCnfName() : cnfId;
+        String message = request != null ? request.getMessage() : "Terminate requested";
+        log.info("Going to terminate cnf : {} ",cnfId);
+        kafkaProducerService.publishCommand(new LcmCommand(cnfId, cnfName, LcmEvent.TERMINATE, message));
+        kafkaProducerService.publishCommand(new LcmCommand(cnfId,cnfName,LcmEvent.TERMINATION_COMPLETE,"Auto-Complete"+message));
+
+        return ResponseEntity.accepted().body(
             new LcmResponse(cnfId, "TERMINATING", "Terminate command accepted", LocalDateTime.now()));
+    }
+
+    @PostMapping("/ns/{nsId}/terminate")
+    public ResponseEntity<LcmResponse> terminate(@PathVariable String nsId) {
+        log.info("NS Terminate trigger received nsId : {}" ,nsId);
+        kafkaProducerService.publishNsTerminateTrigger(nsId);
+        return ResponseEntity.accepted().body(
+                new LcmResponse(nsId, "TERMINATING", "Ns Terminate Trigger accepted", LocalDateTime.now()));
     }
 
     /**
@@ -156,23 +179,33 @@ public class LcmController {
      */
     @PostMapping("/{cnfId}/fail")
     public ResponseEntity<LcmResponse> fail(@PathVariable String cnfId,
-                                             @RequestBody(required = false) LcmRequest request) {
+                                            @RequestBody(required = false) LcmRequest request) {
         String cnfName = request != null ? request.getCnfName() : cnfId;
         String message = request != null ? request.getMessage() : "Instantiation failed";
         kafkaProducerService.publishCommand(new LcmCommand(cnfId, cnfName, LcmEvent.FAIL, message));
         return ResponseEntity.accepted().body(
-            new LcmResponse(cnfId, "INSTANTIATION_FAILED", "Fail command accepted", LocalDateTime.now()));
+                new LcmResponse(cnfId, "INSTANTIATION_FAILED", "Fail command accepted", LocalDateTime.now()));
     }
 
     @GetMapping("/{cnfId}/state")
     public ResponseEntity<LcmResponse> getState(@PathVariable String cnfId) {
         String currentState = stateMachineService.getCurrentState(cnfId).name();
         return ResponseEntity.ok(
-            new LcmResponse(cnfId, currentState, "Current state retrieved", LocalDateTime.now()));
+                new LcmResponse(cnfId, currentState, "Current state retrieved", LocalDateTime.now()));
     }
 
     @GetMapping("/{cnfId}/history")
     public ResponseEntity<List<AuditLog>> getHistory(@PathVariable String cnfId) {
         return ResponseEntity.ok(auditService.getHistory(cnfId));
     }
+
+    @GetMapping("/ns/{nsId}/state")
+    public ResponseEntity<LcmResponse> getNsState(@PathVariable String nsId) {
+        return topologyService.getCnf(nsId)
+                .map(ns -> ResponseEntity.ok(
+                        new LcmResponse(nsId, ns.getCurrentState(),
+                                "NS current state", LocalDateTime.now())))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
 }

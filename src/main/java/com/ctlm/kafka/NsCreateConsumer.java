@@ -62,40 +62,23 @@ public class NsCreateConsumer {
         log.info("=== NS trigger received: nsId={}, nsType={} ===", nsId, request.getNsType());
 
         try {
-            // ── TOPOLOGY PHASE ───────────────────────────────────────────────
-            // Creates NS + all CNFs in Neo4j, both with state INSTANTIATION_IN_PROGRESS.
-            // Also sets up NS_CONTAINS and PARENT_OF relationships.
             Cnf ns = topologyService.triggerNsCreate(request);
             log.info("[TOPOLOGY] NS + CNFs created in Neo4j: ns:{}", ns.toString());
 
             // ── REGISTER FOR STATE TRACKING ──────────────────────────────────
             List<Cnf> cnfs = topologyService.connectIn(nsId);
             nsStateService.registerNsCnfs(nsId, cnfs);
-            log.info("[TRACK] Registered {} CNFs under NS {} for state tracking",
-                cnfs.size(), nsId);
-
-            // ── STATE MACHINE PHASE ───────────────────────────────────────────
-            // Publish two ordered Kafka messages per CNF (same key = same partition = ordered).
-            // Message 1: INSTANTIATE        → UNINSTANTIATED → INSTANTIATION_IN_PROGRESS
-            // Message 2: INSTANTIATION_COMPLETE → INSTANTIATION_IN_PROGRESS → INSTANTIATED
+            log.info("[TRACK] Registered {} CNFs under NS {} for state tracking", cnfs.size(), nsId);
             for (Cnf cnf : cnfs) {
-                String cnfId  = cnf.getCnfId();
-                String cnfName = cnf.getName();
-
                 // Message 1 — initial state machine update
                 kafkaProducerService.publishCommand(new LcmCommand(
-                    cnfId, cnfName, LcmEvent.INSTANTIATE,
-                    "NS trigger initial: " + nsId
-                ));
+                        cnf.getCnfId(), cnf.getName(), LcmEvent.INSTANTIATE, "NS trigger initial: " + nsId));
 
                 // Message 2 — final state machine update (same key → processed after message 1)
                 kafkaProducerService.publishCommand(new LcmCommand(
-                    cnfId, cnfName, LcmEvent.INSTANTIATION_COMPLETE,
-                    "NS trigger complete: " + nsId
-                ));
+                        cnf.getCnfId(), cnf.getName(), LcmEvent.INSTANTIATION_COMPLETE, "NS trigger complete: " + nsId));
 
-                log.info("[SM] INSTANTIATE + INSTANTIATION_COMPLETE queued for CNF: {} ({})",
-                    cnfId, cnf.getSubType());
+                log.info("[SM] INSTANTIATE + INSTANTIATION_COMPLETE queued for CNF: {} ({})", cnf.getCnfId(), cnf.getSubType());
             }
 
             log.info("=== NS trigger done: {} — awaiting state machine processing ===", nsId);

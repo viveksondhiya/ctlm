@@ -1,7 +1,9 @@
 package com.ctlm.topology;
 
+import com.ctlm.dto.CnfBlueprint;
 import com.ctlm.dto.EntityResponse;
 import com.ctlm.dto.NsTriggerRequest;
+import com.ctlm.utils.CnfBlueprintUtils;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -18,41 +20,6 @@ public class TopologyService {
 
     private final CnfNodeRepository cnfNodeRepository;
     private final ObjectMapper objectMapper;
-
-    // ── NS type → CNF blueprint mapping ─────────────────────────
-
-    /**
-     * Defines which CNFs are auto-created for each NS type.
-     *
-     * Both solutions follow the same 3-CNF hierarchy:
-     *   CUCP (isParent=true) --[PARENT_OF]--> CUUP + DU
-     *   NS   --[NS_CONTAINS]--> CUCP, CUUP, DU
-     *
-     * nsType              subType prefix    neTypes
-     * "GnodeB Sub6"     → MACRO_SUB6_*     CU-CP / CU-UP / DU
-     * "GnodeB NGDU_Sub6"→ NGDU_SUB6_*      CU-CP / CU-UP / DU
-     */
-    private static final Map<String, List<CnfBlueprint>> NS_TYPE_TO_CNFS = new LinkedHashMap<>();
-
-    static {
-        // MacroSub6: CUCP (parent) + CUUP + DU
-        NS_TYPE_TO_CNFS.put("GnodeB Sub6", Arrays.asList(
-            new CnfBlueprint("MACRO_SUB6_CU_CP", "CU-CP", true),
-            new CnfBlueprint("MACRO_SUB6_CU_UP", "CU-UP", false),
-            new CnfBlueprint("MACRO_SUB6_DU",    "DU",    false)
-        ));
-
-        // NGDU_Sub6: same 3-CNF structure and hierarchy as MacroSub6,
-        // different subType prefix (NGDU_SUB6_*).
-        NS_TYPE_TO_CNFS.put("GnodeB NGDU_Sub6", Arrays.asList(
-            new CnfBlueprint("NGDU_SUB6_CU_CP", "CU-CP", true),
-            new CnfBlueprint("NGDU_SUB6_CU_UP", "CU-UP", false),
-            new CnfBlueprint("NGDU_SUB6_DU",    "DU",    false)
-        ));
-    }
-
-    /** Describes one CNF that must be created under an NS */
-    private record CnfBlueprint(String subType, String neType, boolean isParent) {}
 
     // ──────────────────────────────────────────────────────────
     //  NS Trigger — auto-creates NS + child CNFs + relationships
@@ -83,34 +50,42 @@ public class TopologyService {
         cnfNodeRepository.save(ns);
         log.info("NS created → INSTANTIATION_IN_PROGRESS: id={}, nsType={}", ns.getCnfId(), ns.getSubType());
 
-        // 2. Determine child CNF blueprints
-        List<CnfBlueprint> blueprints = NS_TYPE_TO_CNFS.get(request.getNsType());
-        if (blueprints == null) {
-            throw new IllegalArgumentException(
-                "Unknown nsType: '" + request.getNsType() + "'. Supported: " + NS_TYPE_TO_CNFS.keySet()
-            );
-        }
+        List<Cnf> allCnfs = createCNF( request, charMap);
+        ns = cnfNodeRepository.findByCnfId(request.getNsId()).orElseThrow();
+        ns.setNsCnfs(new ArrayList<>(allCnfs));
+        cnfNodeRepository.save(ns);
+        return cnfNodeRepository.findByCnfId(request.getNsId()).orElseThrow();
+    }
+
+    private List<Cnf> createCNF(NsTriggerRequest request,Map<String, String> charMap) {
+            // 2. Determine child CNF blueprints
+            List<CnfBlueprint> cnfBlueprints = CnfBlueprintUtils.getCnfBlueprints(request.getNsType());
+            if (cnfBlueprints == null) {
+                throw new IllegalArgumentException(
+                        "Unknown nsType: '" + request.getNsType() + "'. Supported: "
+                );
+            }
 
         // 3. Create CNF nodes
         List<Cnf> allCnfs = new ArrayList<>();
         Cnf parentCnf = null;
         List<Cnf> childCnfs = new ArrayList<>();
 
-        for (CnfBlueprint cnfEntity : blueprints) {
-            String cnfId = request.getNsId() + "-" + cnfEntity.subType().toLowerCase().replace("_", "-");
+        for (CnfBlueprint cnfEntity : cnfBlueprints) {
+            String cnfId = request.getNsId() + "-" + cnfEntity.getSubType().toLowerCase().replace("_", "-");
             // Each CNF created immediately as INSTANTIATION_IN_PROGRESS
             Cnf cnf = new Cnf( cnfId,  request.getName(),
-                "CNF",  cnfEntity.subType(),  cnfEntity.neType(),
-                "INSTANTIATION_IN_PROGRESS"
+                    "CNF",  cnfEntity.getSubType(),  cnfEntity.getSubType(),
+                    "INSTANTIATION_IN_PROGRESS"
             );
             cnf.setTechnology(charMap.get("technology"));
             cnf.setVendor(charMap.get("vendor"));
             Map<String, String> cnfCharMap = new LinkedHashMap<>(charMap);
-            cnfCharMap.put("subType", cnfEntity.subType());
-            cnfCharMap.put("cnfneType", cnfEntity.neType());
+            cnfCharMap.put("subType", cnfEntity.getSubType());
+            cnfCharMap.put("cnfneType", cnfEntity.getNeType());
             cnf.setCharacteristics(toJson(cnfCharMap));
             cnfNodeRepository.save(cnf);
-            log.info("CNF created → INSTANTIATION_IN_PROGRESS: id={}, subType={}", cnfId, cnfEntity.subType());
+            log.info("CNF created → INSTANTIATION_IN_PROGRESS: id={}, subType={}", cnfId, cnfEntity.getSubType());
 
             allCnfs.add(cnf);
             if (cnfEntity.isParent()) {
@@ -120,21 +95,14 @@ public class TopologyService {
             }
         }
 
-        // 4. NS_CONTAINS → all CNFs
-        ns = cnfNodeRepository.findByCnfId(request.getNsId()).orElseThrow();
-        ns.setNsCnfs(new ArrayList<>(allCnfs));
-        cnfNodeRepository.save(ns);
-
         // 5. PARENT_OF: parentCnf (CUCP) → childCnfs (CUUP + DU)
         if (parentCnf != null && !childCnfs.isEmpty()) {
             Cnf parent = cnfNodeRepository.findByCnfId(parentCnf.getCnfId()).orElseThrow();
             parent.setChildren(new ArrayList<>(childCnfs));
             cnfNodeRepository.save(parent);
-            log.info("PARENT_OF: {} -> {}", parent.getCnfId(),
-                childCnfs.stream().map(Cnf::getCnfId).collect(Collectors.joining(", ")));
+            log.info("PARENT_OF: {} -> {}", parent.getCnfId(), childCnfs.stream().map(Cnf::getCnfId).collect(Collectors.joining(", ")));
         }
-
-        return cnfNodeRepository.findByCnfId(request.getNsId()).orElseThrow();
+        return allCnfs;
     }
 
     // ──────────────────────────────────────────────────────────
@@ -146,8 +114,7 @@ public class TopologyService {
      * Returns full entity data + connect.out (parent) + connect.in (children).
      */
     public EntityResponse getEntityById(String id) {
-        Cnf node = cnfNodeRepository.findByCnfId(id)
-            .orElseThrow(() -> new IllegalArgumentException("Entity not found: " + id));
+        Cnf node = cnfNodeRepository.findByCnfId(id).orElseThrow(() -> new IllegalArgumentException("Entity not found: " + id));
 
         EntityResponse resp = new EntityResponse();
         resp.setId(node.getCnfId());
@@ -168,7 +135,6 @@ public class TopologyService {
         // connect.CNF.in → children
         List<Cnf> children = connectIn(id);
         resp.setConnectIn(children.stream().map(this::toRef).collect(Collectors.toList()));
-
         return resp;
     }
 

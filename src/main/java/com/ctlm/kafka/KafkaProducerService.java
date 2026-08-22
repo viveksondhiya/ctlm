@@ -22,6 +22,7 @@ public class KafkaProducerService {
     private static final String TOPIC_LCM_COMMANDS    = "lcm-commands";
     private static final String TOPIC_NS_TRIGGER      = "lcm-ns-create-trigger";
     private static final String TOPIC_NS_CALLBACK     = "lcm-ns-callback";
+    private static final String TOPIC_NS_TERMINATE_TRIGGER     = "lcm-ns-terminate-trigger";
 
     // KafkaTemplate<String, Object> works with JsonSerializer for any payload type
     private final KafkaTemplate<String, Object> kafkaTemplate;
@@ -51,5 +52,15 @@ public class KafkaProducerService {
     public void publishNsCallback(NsCallbackEvent event) {
         log.info("Publishing NS callback: nsId={}, status={}", event.getNsId(), event.getStatus());
         kafkaTemplate.send(TOPIC_NS_CALLBACK, event.getNsId(), event);
+    }
+
+
+    /**
+     * Publish NS Termination .
+     * Consumed by: lcm consumer on "lcm-ns-terminate-trigger" topic.
+     */
+    public void publishNsTerminateTrigger(String nsId) {
+        log.info("publishNsTerminateTrigger {}",nsId);
+        kafkaTemplate.send(TOPIC_NS_TERMINATE_TRIGGER, nsId, nsId);
     }
 }
