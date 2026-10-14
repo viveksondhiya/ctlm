@@ -1,0 +1,45 @@
+INSTANTIATION_IN_PROGRESS - CU-UP
+
+  CU-UP remains in INSTANTIATION_IN_PROGRESS when the deployment acknowledgement is not received from the underlying infrastructure.
+  This typically occurs when the Kubernetes pod fails to reach Running state or when the lifecycle management acknowledgement
+  timeout is exceeded.
+
+  Recommended action: Check CU-UP pod logs using kubectl logs, verify the deployment status, and inspect lifecycle
+  acknowledgement logs in the LCM orchestrator. Verify CU-UP has sufficient CPU and memory resources.
+
+  ---
+
+  INSTANTIATION_IN_PROGRESS - CU-CP
+
+  CU-CP remains pending if the F1 interface initialization fails or if the underlying VNF descriptor validation is rejected.
+  CU-CP is the parent CNF and must be fully INSTANTIATED before CU-UP and DU can proceed.
+
+  Recommended action: Verify CU-CP pod is Running, check F1 interface configuration, and review VNF descriptor.
+
+  ---
+
+  INSTANTIATION_IN_PROGRESS - DU
+
+  DU remains pending when the fronthaul connection to CU-CP cannot be established or when the radio unit acknowledgement
+  is not received within the expected window.
+
+  Recommended action: Check fronthaul connectivity, verify VLAN configuration, and inspect DU deployment logs.
+
+  ---
+
+  INSTANTIATION_FAILED - General
+
+  A CNF moves to INSTANTIATION_FAILED when the lifecycle management operation exceeds the timeout threshold or when
+  a hard failure is detected in the deployment pipeline. This causes the parent NS to also move to INSTANTIATION_FAILED.
+
+  Recommended action: Check audit logs in the LCM controller, inspect Kubernetes events, and retry instantiation
+  after resolving the underlying issue.
+
+  ---
+
+  NS stays in INSTANTIATION_IN_PROGRESS
+
+  An NS stays in INSTANTIATION_IN_PROGRESS when one or more of its child CNFs have not yet reached the INSTANTIATED state.
+  The NS transitions to INSTANTIATED only when ALL three CNFs (CU-CP, CU-UP, DU) are fully INSTANTIATED.
+
+  Recommended action: Use getCnfStatuses to identify which CNF is blocking, then investigate that specific CNF.

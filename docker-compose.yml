@@ -69,6 +69,7 @@ services:
       MYSQL_DB: ctlmdb
       MYSQL_USER: root
       MYSQL_PASSWORD: root
+      GROQ_API_KEY: ${GROQ_API_KEY}
     depends_on:
       kafka:
         condition: service_healthy
